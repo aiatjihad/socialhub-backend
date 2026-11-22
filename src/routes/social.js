@@ -316,7 +316,7 @@ router.get('/tiktok/callback', (req, res) => {
 <script>
   var code = ${JSON.stringify(code || '')};
   try { if (window.opener) { window.opener.postMessage({ type: 'socialhub_tt_code', code: code }, '*'); } } catch(e){}
-  location.replace(${JSON.stringify(front)} + '#tt_code=' + encodeURIComponent(code));
+  location.replace(${JSON.stringify(front)} + '?tt_code=' + encodeURIComponent(code) + '#/accounts');
 </script></body></html>`);
 });
 
