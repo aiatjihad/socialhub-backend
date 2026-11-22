@@ -9,7 +9,13 @@ const IG_VERSION = 'https://graph.instagram.com/v21.0';
 const uploadDir = path.resolve(process.env.UPLOAD_DIR || './uploads');
 // Always derive from the incoming request so Render's assigned hostname works
 // without having to configure PUBLIC_BASE_URL by hand.
-const publicBase = req => `${req.protocol}://${req.get('host')}`.replace(/\/$/, '');
+const publicBase = req => {
+  const host = req.get('host') || '';
+  // Always use https for a public host. Behind a TLS-terminating proxy
+  // (Render) req.protocol can be http, which yields invalid OAuth callbacks.
+  const proto = /^(localhost|127\.0\.0\.1)(:|$)/.test(host) ? 'http' : 'https';
+  return `${proto}://${host}`.replace(/\/$/, '');
+};
 const callbackUrl = req => `${publicBase(req)}/api/social/instagram/callback`;
 const tiktokCallbackUrl = req => `${publicBase(req)}/api/social/tiktok/callback`;
 

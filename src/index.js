@@ -4,6 +4,9 @@ const path = require('path');
 const fs = require('fs');
 
 const app = express();
+// Render terminates TLS and forwards over HTTP; trust X-Forwarded-Proto so
+// req.protocol is https and generated callback URLs are accepted by TikTok/Meta.
+app.set('trust proxy', true);
 const PORT = process.env.PORT || 3000;
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
 
