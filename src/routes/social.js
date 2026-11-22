@@ -353,7 +353,7 @@ router.post('/tiktok/publish', async (req, res) => {
   try {
     const {
       accessToken, videoUrl, videoBase64, mime = 'video/mp4',
-      title = '', privacy = 'PUBLIC_TO_EVERYONE'
+      title = '', privacy = 'SELF_ONLY'
     } = req.body;
     if (!accessToken) return res.status(400).json({ error: 'accessToken required' });
 
