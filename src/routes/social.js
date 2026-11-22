@@ -200,6 +200,28 @@ router.post('/instagram/refresh', async (req, res) => {
   }
 });
 
+// Unified Login returns a Facebook user id; map it to the linked Instagram
+// business account. Instagram Login already returns the IG user id directly.
+async function resolveIgUserId(accessToken, hint) {
+  if (hint) {
+    try {
+      const r = await axios.get(`${IG_VERSION}/${hint}`, {
+        params: { fields: 'id,username', access_token: accessToken }
+      });
+      if (r.data?.id) return r.data.id;
+    } catch { /* try the Facebook Page link below */ }
+  }
+  try {
+    const r = await axios.get(`${IG_VERSION}/me/accounts`, {
+      params: { fields: 'instagram_business_account', access_token: accessToken }
+    });
+    const found = (r.data?.data || []).map(p => p.instagram_business_account?.id).filter(Boolean);
+    if (found.length) return found[0];
+  } catch { /* ignore */ }
+  const me = await axios.get(`${IG_VERSION}/me`, { params: { fields: 'id', access_token: accessToken } });
+  return me.data.id;
+}
+
 // Verify token / get profile
 router.get('/instagram/me', async (req, res) => {
   try {
@@ -220,10 +242,7 @@ router.post('/instagram/publish', async (req, res) => {
     if (!mediaUrl) return res.status(400).json({ error: 'mediaUrl is required' });
     accessToken = accessToken || await resolvedIgToken();
     if (!accessToken) return res.status(500).json({ error: 'Instagram token not configured on backend' });
-    if (!igUserId) {
-      const me = await axios.get(`${IG_VERSION}/me`, { params: { fields: 'id', access_token: accessToken } });
-      igUserId = me.data.id;
-    }
+    igUserId = await resolveIgUserId(accessToken, igUserId);
     const params = {
       media_type: mediaType,
       caption,
