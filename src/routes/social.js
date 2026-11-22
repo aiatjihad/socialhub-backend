@@ -1,0 +1,261 @@
+const express = require('express');
+const router = express.Router();
+const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+const IG_VERSION = 'https://graph.instagram.com/v21.0';
+const uploadDir = path.resolve(process.env.UPLOAD_DIR || './uploads');
+const publicBase = () => (process.env.PUBLIC_BASE_URL || `http://localhost:${process.env.PORT || 3000}`).replace(/\/$/, '');
+
+function need(res, names) {
+  const missing = names.filter(n => !process.env[n]);
+  if (missing.length) {
+    res.status(500).json({ error: 'Backend missing config', missing });
+    return false;
+  }
+  return true;
+}
+
+/* ---------- Media hosting: frontend sends base64, we return a public URL ---------- */
+router.post('/media', async (req, res) => {
+  try {
+    const { data, mime = 'image/jpeg', ext } = req.body;
+    if (!data) return res.status(400).json({ error: 'Missing base64 data' });
+    const clean = data.replace(/^data:[^;]+;base64,/, '');
+    const buf = Buffer.from(clean, 'base64');
+    if (!buf.length || buf.length > 50 * 1024 * 1024) {
+      return res.status(400).json({ error: 'Empty or too-large file (max 50MB)' });
+    }
+    if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+    const map = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'video/mp4': '.mp4', 'video/quicktime': '.mov' };
+    const suffix = ext || map[mime] || '.bin';
+    const name = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}${suffix}`;
+    fs.writeFileSync(path.join(uploadDir, name), buf);
+    res.json({ url: `${publicBase()}/uploads/${name}`, size: buf.length, mime });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ---------- Instagram ---------- */
+
+// Step 1 URL for the user to open (Instagram Login)
+router.get('/instagram/auth-url', (req, res) => {
+  if (!need(res, ['INSTAGRAM_APP_ID', 'INSTAGRAM_REDIRECT_URI'])) return;
+  const state = crypto.randomBytes(12).toString('hex');
+  const url = new URL('https://www.instagram.com/oauth/authorize');
+  url.searchParams.set('client_id', process.env.INSTAGRAM_APP_ID);
+  url.searchParams.set('redirect_uri', process.env.INSTAGRAM_REDIRECT_URI);
+  url.searchParams.set('scope', 'instagram_content_publish,instagram_basic');
+  url.searchParams.set('response_type', 'code');
+  url.searchParams.set('state', state);
+  res.json({ url: url.toString(), state });
+});
+
+// OAuth callback page: hands the code to the SocialHub tab
+router.get('/instagram/callback', (req, res) => {
+  const code = req.query.code;
+  const err = req.query.error;
+  const front = (process.env.FRONTEND_URL || 'https://aiatjihad.github.io/social-media-manager/').replace(/\/$/, '');
+  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><title>Instagram connected</title></head>
+<body style="font:16px sans-serif;text-align:center;padding:40px">
+<p>${err ? 'Instagram error: ' + err : 'Connecting Instagram…'}</p>
+<script>
+  var code = ${JSON.stringify(code || '')};
+  try { if (window.opener) { window.opener.postMessage({ type: 'socialhub_ig_code', code: code }, '*'); } } catch(e){}
+  location.replace(${JSON.stringify(front)} + '#ig_code=' + encodeURIComponent(code));
+</script></body></html>`);
+});
+
+// Exchange short-lived code -> long-lived token
+router.post('/instagram/token', async (req, res) => {
+  try {
+    if (!need(res, ['INSTAGRAM_APP_ID', 'INSTAGRAM_APP_SECRET', 'INSTAGRAM_REDIRECT_URI'])) return;
+    const { code } = req.body;
+    if (!code) return res.status(400).json({ error: 'Missing code' });
+
+    const short = await axios.post('https://api.instagram.com/oauth/access_token', null, {
+      params: {
+        client_id: process.env.INSTAGRAM_APP_ID,
+        client_secret: process.env.INSTAGRAM_APP_SECRET,
+        grant_type: 'authorization_code',
+        redirect_uri: process.env.INSTAGRAM_REDIRECT_URI,
+        code
+      }
+    });
+    const token = short.data.access_token;
+    if (!token) return res.status(400).json({ error: 'No access_token returned', detail: short.data });
+
+    const long = await axios.get('https://graph.instagram.com/access_token', {
+      params: {
+        grant_type: 'ig_exchange_token',
+        client_secret: process.env.INSTAGRAM_APP_SECRET,
+        access_token: token
+      }
+    });
+    res.json({
+      accessToken: long.data.access_token,
+      expiresIn: long.data.expires_in,
+      userId: long.data.user_id,
+      username: short.data.user && short.data.user.username
+    });
+  } catch (e) {
+    res.status(400).json({ error: e.response?.data?.error_message || e.message });
+  }
+});
+
+// Refresh a long-lived token (60 days)
+router.post('/instagram/refresh', async (req, res) => {
+  try {
+    if (!need(res, ['INSTAGRAM_APP_SECRET'])) return;
+    const { accessToken } = req.body;
+    const r = await axios.get('https://graph.instagram.com/refresh_access_token', {
+      params: { grant_type: 'ig_refresh_token', access_token: accessToken }
+    });
+    res.json({ accessToken: r.data.access_token, expiresIn: r.data.expires_in });
+  } catch (e) {
+    res.status(400).json({ error: e.response?.data?.error_message || e.message });
+  }
+});
+
+// Verify token / get profile
+router.get('/instagram/me', async (req, res) => {
+  try {
+    const { accessToken } = req.query;
+    const r = await axios.get(`${IG_VERSION}/me`, {
+      params: { fields: 'id,username,account_type,media_count', access_token: accessToken }
+    });
+    res.json(r.data);
+  } catch (e) {
+    res.status(400).json({ error: e.response?.data?.error?.message || e.message });
+  }
+});
+
+// Publish image or reel using our public media URL
+router.post('/instagram/publish', async (req, res) => {
+  try {
+    const { accessToken, igUserId, mediaUrl, caption = '', mediaType = 'IMAGE', thumbUrl } = req.body;
+    if (!accessToken || !igUserId || !mediaUrl) {
+      return res.status(400).json({ error: 'accessToken, igUserId and mediaUrl are required' });
+    }
+    const params = {
+      media_type: mediaType,
+      caption,
+      access_token: accessToken
+    };
+    params[mediaType === 'REELS' ? 'video_url' : 'image_url'] = mediaUrl;
+    if (mediaType === 'REELS' && thumbUrl) params.thumb_offset = 0;
+
+    const container = await axios.post(`${IG_VERSION}/${igUserId}/media`, null, { params });
+    const containerId = container.data.id;
+
+    let status = 'IN_PROGRESS';
+    for (let i = 0; i < 30 && status === 'IN_PROGRESS'; i++) {
+      await new Promise(r => setTimeout(r, 4000));
+      const s = await axios.get(`${IG_VERSION}/${containerId}`, {
+        params: { fields: 'status_code,error_message', access_token: accessToken }
+      });
+      status = s.data.status_code;
+      if (s.data.error_message) {
+        return res.status(400).json({ error: s.data.error_message, containerId, status });
+      }
+    }
+    if (status !== 'FINISHED') {
+      return res.status(408).json({ error: 'Media processing timed out', status, containerId });
+    }
+
+    const published = await axios.post(`${IG_VERSION}/${igUserId}/media_publish`, null, {
+      params: { creation_id: containerId, access_token: accessToken }
+    });
+    res.json({ id: published.data.id, url: `https://www.instagram.com/p/${published.data.id}/` });
+  } catch (e) {
+    res.status(400).json({ error: e.response?.data?.error?.message || e.message });
+  }
+});
+
+/* ---------- TikTok ---------- */
+
+router.get('/tiktok/auth-url', (req, res) => {
+  if (!need(res, ['TIKTOK_CLIENT_KEY', 'TIKTOK_REDIRECT_URI'])) return;
+  const state = crypto.randomBytes(12).toString('hex');
+  const csrf = crypto.randomBytes(12).toString('hex');
+  const url = new URL('https://www.tiktok.com/v2/auth/authorize/');
+  url.searchParams.set('client_key', process.env.TIKTOK_CLIENT_KEY);
+  url.searchParams.set('scope', 'video.publish,user.info.basic');
+  url.searchParams.set('response_type', 'code');
+  url.searchParams.set('redirect_uri', process.env.TIKTOK_REDIRECT_URI);
+  url.searchParams.set('state', state);
+  url.searchParams.set('code_challenge_method', 'S256');
+  // PKCE would go here; kept simple for now
+  res.json({ url: url.toString(), state, csrf });
+});
+
+router.get('/tiktok/callback', (req, res) => {
+  const code = req.query.code;
+  const err = req.query.error;
+  const front = (process.env.FRONTEND_URL || 'https://aiatjihad.github.io/social-media-manager/').replace(/\/$/, '');
+  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><title>TikTok connected</title></head>
+<body style="font:16px sans-serif;text-align:center;padding:40px">
+<p>${err ? 'TikTok error: ' + err : 'Connecting TikTok…'}</p>
+<script>
+  var code = ${JSON.stringify(code || '')};
+  try { if (window.opener) { window.opener.postMessage({ type: 'socialhub_tt_code', code: code }, '*'); } } catch(e){}
+  location.replace(${JSON.stringify(front)} + '#tt_code=' + encodeURIComponent(code));
+</script></body></html>`);
+});
+
+router.post('/tiktok/token', async (req, res) => {
+  try {
+    if (!need(res, ['TIKTOK_CLIENT_KEY', 'TIKTOK_CLIENT_SECRET', 'TIKTOK_REDIRECT_URI'])) return;
+    const { code } = req.body;
+    if (!code) return res.status(400).json({ error: 'Missing code' });
+    const r = await axios.post(
+      'https://open.tiktokapis.com/v2/oauth/token/',
+      new URLSearchParams({
+        client_key: process.env.TIKTOK_CLIENT_KEY,
+        client_secret: process.env.TIKTOK_CLIENT_SECRET,
+        code,
+        grant_type: 'authorization_code',
+        redirect_uri: process.env.TIKTOK_REDIRECT_URI
+      }),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+    );
+    res.json({
+      accessToken: r.data.access_token,
+      refreshToken: r.data.refresh_token,
+      expiresIn: r.data.expires_in,
+      openId: r.data.open_id
+    });
+  } catch (e) {
+    res.status(400).json({ error: e.response?.data?.error_description || e.message });
+  }
+});
+
+// Publish from a public URL (PULL_FROM_URL) — no file upload needed
+router.post('/tiktok/publish', async (req, res) => {
+  try {
+    const { accessToken, videoUrl, title = '', privacy = 'PUBLIC_TO_EVERYONE' } = req.body;
+    if (!accessToken || !videoUrl) return res.status(400).json({ error: 'accessToken and videoUrl required' });
+    const init = await axios.post(
+      'https://open.tiktokapis.com/v2/post/publish/video/init/',
+      {
+        post_info: {
+          title: title.substring(0, 150),
+          privacy_level: privacy,
+          disable_duet: false,
+          disable_comment: false,
+          disable_stitch: false
+        },
+        source_info: { source: 'PULL_FROM_URL', video_url: videoUrl }
+      },
+      { headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' } }
+    );
+    res.json({ publishId: init.data?.data?.publish_id, status: init.data?.data?.status });
+  } catch (e) {
+    res.status(400).json({ error: e.response?.data?.error?.message || e.message });
+  }
+});
+
+module.exports = router;
