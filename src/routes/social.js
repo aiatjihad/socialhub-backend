@@ -407,8 +407,18 @@ router.post('/tiktok/publish', async (req, res) => {
         },
         source_info: sourceInfo
       },
-      { headers }
+      { headers, validateStatus: () => true }
     );
+    // Surface the full TikTok error (code + message) when init is rejected.
+    if (init.status >= 400 || init.data?.error) {
+      const err = init.data?.error || {};
+      console.error('[tiktok] init rejected', init.status, JSON.stringify(init.data));
+      return res.status(400).json({
+        error: `[${err.code ?? init.status}] ${err.message || 'TikTok init rejected'}`,
+        code: err.code,
+        details: init.data
+      });
+    }
     const publishId = init.data?.data?.publish_id;
     const uploadUrl = init.data?.data?.upload_url;
 
@@ -428,7 +438,13 @@ router.post('/tiktok/publish', async (req, res) => {
 
     res.json({ publishId, status: init.data?.data?.status, uploadUrl: uploadUrl ? true : false });
   } catch (e) {
-    res.status(400).json({ error: e.response?.data?.error?.message || e.message });
+    console.error('[tiktok] publish failed', JSON.stringify(e.response?.data || {}), e.message);
+    const err = e.response?.data?.error || {};
+    res.status(400).json({
+      error: err.code ? `[${err.code}] ${err.message || e.message}` : (err.message || e.message),
+      code: err.code,
+      details: e.response?.data
+    });
   }
 });
 
