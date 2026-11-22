@@ -140,15 +140,17 @@ router.post('/instagram/token', async (req, res) => {
     // 2) Legacy Instagram Login
     if (!token) {
       try {
-        const r = await axios.post('https://api.instagram.com/oauth/access_token', null, {
-          params: {
+        const r = await axios.post(
+          'https://api.instagram.com/oauth/access_token',
+          new URLSearchParams({
             client_id: process.env.INSTAGRAM_APP_ID,
             client_secret: process.env.INSTAGRAM_APP_SECRET,
             grant_type: 'authorization_code',
             redirect_uri: redirectUri,
             code
-          }
-        });
+          }),
+          { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+        );
         token = r.data.access_token;
         shortData = r.data;
       } catch (e) {
