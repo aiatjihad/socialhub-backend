@@ -55,8 +55,8 @@ async function resolvedIgToken() {
   const r = await axios.get('https://graph.instagram.com/access_token', {
     params: {
       grant_type: 'ig_exchange_token',
-      client_secret: process.env.INSTAGRAM_APP_SECRET,
-      access_token: process.env.INSTAGRAM_SHORT_TOKEN
+      client_secret: String(process.env.INSTAGRAM_APP_SECRET || '').trim(),
+      access_token: String(process.env.INSTAGRAM_SHORT_TOKEN || '').trim()
     }
   });
   cachedIgToken = r.data.access_token;
@@ -121,20 +121,23 @@ router.post('/instagram/token', async (req, res) => {
     let shortData = null;
     const errors = [];
 
-    // 1) Unified Login (Facebook Login for Business) — current Meta default
-    try {
-      const r = await axios.get('https://graph.facebook.com/v21.0/oauth/access_token', {
-        params: {
-          client_id: process.env.INSTAGRAM_APP_ID,
-          client_secret: process.env.INSTAGRAM_APP_SECRET,
-          code,
-          redirect_uri: redirectUri
-        }
-      });
-      token = r.data.access_token;
-      shortData = r.data;
-    } catch (e) {
-      errors.push('unified: ' + (e.response?.data?.error?.message || e.message));
+    const appId = String(process.env.INSTAGRAM_APP_ID || '').trim();
+    const appSecret = String(process.env.INSTAGRAM_APP_SECRET || '').trim();
+
+    // 1) Unified Login (Facebook Login for Business). Try current + legacy
+    // Graph versions because older apps are not always enabled on the newest.
+    for (const ver of ['v23.0', 'v21.0', '']) {
+      if (token) break;
+      try {
+        const host = `https://graph.facebook.com${ver ? '/' + ver : ''}/oauth/access_token`;
+        const r = await axios.get(host, {
+          params: { client_id: appId, client_secret: appSecret, code, redirect_uri: redirectUri }
+        });
+        token = r.data.access_token;
+        shortData = r.data;
+      } catch (e) {
+        errors.push(`unified(${ver || 'default'}): ` + (e.response?.data?.error?.message || e.message));
+      }
     }
 
     // 2) Legacy Instagram Login
@@ -143,8 +146,8 @@ router.post('/instagram/token', async (req, res) => {
         const r = await axios.post(
           'https://api.instagram.com/oauth/access_token',
           new URLSearchParams({
-            client_id: process.env.INSTAGRAM_APP_ID,
-            client_secret: process.env.INSTAGRAM_APP_SECRET,
+            client_id: appId,
+            client_secret: appSecret,
             grant_type: 'authorization_code',
             redirect_uri: redirectUri,
             code
@@ -167,7 +170,7 @@ router.post('/instagram/token', async (req, res) => {
       const long = await axios.get('https://graph.instagram.com/access_token', {
         params: {
           grant_type: 'ig_exchange_token',
-          client_secret: process.env.INSTAGRAM_APP_SECRET,
+          client_secret: appSecret,
           access_token: token
         }
       });
