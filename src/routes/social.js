@@ -45,6 +45,37 @@ router.post('/media', async (req, res) => {
 
 /* ---------- Instagram ---------- */
 
+// Meta's "API setup with Instagram login" dashboard gives a short-lived token.
+// Exchange it for a 60-day token at runtime using the app secret — no redirect URI needed.
+let cachedIgToken = null;
+async function resolvedIgToken() {
+  if (process.env.INSTAGRAM_ACCESS_TOKEN) return process.env.INSTAGRAM_ACCESS_TOKEN;
+  if (cachedIgToken) return cachedIgToken;
+  if (!process.env.INSTAGRAM_SHORT_TOKEN || !process.env.INSTAGRAM_APP_SECRET) return null;
+  const r = await axios.get('https://graph.instagram.com/access_token', {
+    params: {
+      grant_type: 'ig_exchange_token',
+      client_secret: process.env.INSTAGRAM_APP_SECRET,
+      access_token: process.env.INSTAGRAM_SHORT_TOKEN
+    }
+  });
+  cachedIgToken = r.data.access_token;
+  return cachedIgToken;
+}
+
+router.post('/instagram/bootstrap', async (req, res) => {
+  try {
+    const token = await resolvedIgToken();
+    if (!token) return res.status(500).json({ error: 'Set INSTAGRAM_SHORT_TOKEN (or INSTAGRAM_ACCESS_TOKEN) on the backend' });
+    const me = await axios.get(`${IG_VERSION}/me`, {
+      params: { fields: 'id,username,account_type', access_token: token }
+    });
+    res.json({ connected: true, userId: me.data.id, username: me.data.username, accountType: me.data.account_type });
+  } catch (e) {
+    res.status(400).json({ error: e.response?.data?.error?.message || e.message });
+  }
+});
+
 // Step 1 URL for the user to open (Instagram Login)
 router.get('/instagram/auth-url', (req, res) => {
   if (!need(res, ['INSTAGRAM_APP_ID'])) return;
@@ -140,9 +171,13 @@ router.get('/instagram/me', async (req, res) => {
 // Publish image or reel using our public media URL
 router.post('/instagram/publish', async (req, res) => {
   try {
-    const { accessToken, igUserId, mediaUrl, caption = '', mediaType = 'IMAGE', thumbUrl } = req.body;
-    if (!accessToken || !igUserId || !mediaUrl) {
-      return res.status(400).json({ error: 'accessToken, igUserId and mediaUrl are required' });
+    let { accessToken, igUserId, mediaUrl, caption = '', mediaType = 'IMAGE', thumbUrl } = req.body;
+    if (!mediaUrl) return res.status(400).json({ error: 'mediaUrl is required' });
+    accessToken = accessToken || await resolvedIgToken();
+    if (!accessToken) return res.status(500).json({ error: 'Instagram token not configured on backend' });
+    if (!igUserId) {
+      const me = await axios.get(`${IG_VERSION}/me`, { params: { fields: 'id', access_token: accessToken } });
+      igUserId = me.data.id;
     }
     const params = {
       media_type: mediaType,
