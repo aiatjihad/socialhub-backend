@@ -295,8 +295,8 @@ router.get('/tiktok/auth-url', (req, res) => {
   url.searchParams.set('response_type', 'code');
   url.searchParams.set('redirect_uri', tiktokCallbackUrl(req));
   url.searchParams.set('state', state);
-  url.searchParams.set('code_challenge_method', 'S256');
-  // PKCE would go here; kept simple for now
+  // No PKCE: TikTok rejects code_challenge_method without a matching
+  // code_challenge, and we do not implement a challenge/verifier pair here.
   res.json({ url: url.toString(), state, csrf });
 });
 
