@@ -76,17 +76,20 @@ router.post('/instagram/bootstrap', async (req, res) => {
   }
 });
 
-// Step 1 URL for the user to open (Instagram Login)
+// Step 1 URL for the user to open (Instagram / Facebook "Unified Login").
+// The redirect URI must be one registered in the Meta app dashboard.
 router.get('/instagram/auth-url', (req, res) => {
   if (!need(res, ['INSTAGRAM_APP_ID'])) return;
   const state = crypto.randomBytes(12).toString('hex');
-  const url = new URL('https://www.instagram.com/oauth/authorize');
+  const redirectUri = req.query.redirect_uri
+    || (process.env.FRONTEND_URL || `${publicBase(req)}/`).replace(/\/$/, '') + '/';
+  const url = new URL('https://www.facebook.com/dialog/oauth');
   url.searchParams.set('client_id', process.env.INSTAGRAM_APP_ID);
-  url.searchParams.set('redirect_uri', callbackUrl(req));
-  url.searchParams.set('scope', 'instagram_content_publish,instagram_basic');
+  url.searchParams.set('redirect_uri', redirectUri);
+  url.searchParams.set('scope', 'instagram_basic,instagram_content_publish');
   url.searchParams.set('response_type', 'code');
   url.searchParams.set('state', state);
-  res.json({ url: url.toString(), state });
+  res.json({ url: url.toString(), state, redirectUri });
 });
 
 // OAuth callback page: hands the code to the SocialHub tab
@@ -104,40 +107,82 @@ router.get('/instagram/callback', (req, res) => {
 </script></body></html>`);
 });
 
-// Exchange short-lived code -> long-lived token
+// Exchange short-lived code -> long-lived token.
+// Supports both Meta "Unified Login" (graph.facebook.com) and legacy
+// "Instagram Login" (api.instagram.com) token endpoints.
 router.post('/instagram/token', async (req, res) => {
   try {
     if (!need(res, ['INSTAGRAM_APP_ID', 'INSTAGRAM_APP_SECRET'])) return;
     const { code } = req.body;
     if (!code) return res.status(400).json({ error: 'Missing code' });
+    const redirectUri = req.body.redirect_uri || callbackUrl(req);
 
-    const short = await axios.post('https://api.instagram.com/oauth/access_token', null, {
-      params: {
-        client_id: process.env.INSTAGRAM_APP_ID,
-        client_secret: process.env.INSTAGRAM_APP_SECRET,
-        grant_type: 'authorization_code',
-        redirect_uri: callbackUrl(req),
-        code
-      }
-    });
-    const token = short.data.access_token;
-    if (!token) return res.status(400).json({ error: 'No access_token returned', detail: short.data });
+    let token = null;
+    let shortData = null;
+    const errors = [];
 
-    const long = await axios.get('https://graph.instagram.com/access_token', {
-      params: {
-        grant_type: 'ig_exchange_token',
-        client_secret: process.env.INSTAGRAM_APP_SECRET,
-        access_token: token
+    // 1) Unified Login (Facebook Login for Business) — current Meta default
+    try {
+      const r = await axios.get('https://graph.facebook.com/v21.0/oauth/access_token', {
+        params: {
+          client_id: process.env.INSTAGRAM_APP_ID,
+          client_secret: process.env.INSTAGRAM_APP_SECRET,
+          code,
+          redirect_uri: redirectUri
+        }
+      });
+      token = r.data.access_token;
+      shortData = r.data;
+    } catch (e) {
+      errors.push('unified: ' + (e.response?.data?.error?.message || e.message));
+    }
+
+    // 2) Legacy Instagram Login
+    if (!token) {
+      try {
+        const r = await axios.post('https://api.instagram.com/oauth/access_token', null, {
+          params: {
+            client_id: process.env.INSTAGRAM_APP_ID,
+            client_secret: process.env.INSTAGRAM_APP_SECRET,
+            grant_type: 'authorization_code',
+            redirect_uri: redirectUri,
+            code
+          }
+        });
+        token = r.data.access_token;
+        shortData = r.data;
+      } catch (e) {
+        errors.push('instagram: ' + (e.response?.data?.error_message || e.message));
       }
-    });
+    }
+
+    if (!token) return res.status(400).json({ error: errors.join(' | ') || 'No access_token returned' });
+
+    // Exchange for a 60-day long-lived token
+    let longToken = token;
+    let expiresIn = shortData.expires_in;
+    try {
+      const long = await axios.get('https://graph.instagram.com/access_token', {
+        params: {
+          grant_type: 'ig_exchange_token',
+          client_secret: process.env.INSTAGRAM_APP_SECRET,
+          access_token: token
+        }
+      });
+      longToken = long.data.access_token;
+      expiresIn = long.data.expires_in;
+    } catch (e) {
+      // Keep the short token if the exchange fails (still usable for ~1 hour).
+    }
+
     res.json({
-      accessToken: long.data.access_token,
-      expiresIn: long.data.expires_in,
-      userId: long.data.user_id,
-      username: short.data.user && short.data.user.username
+      accessToken: longToken,
+      expiresIn,
+      userId: shortData.user_id,
+      username: shortData.user && shortData.user.username
     });
   } catch (e) {
-    res.status(400).json({ error: e.response?.data?.error_message || e.message });
+    res.status(400).json({ error: e.response?.data?.error?.message || e.message });
   }
 });
 
