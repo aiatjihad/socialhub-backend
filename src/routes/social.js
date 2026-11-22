@@ -7,7 +7,11 @@ const crypto = require('crypto');
 
 const IG_VERSION = 'https://graph.instagram.com/v21.0';
 const uploadDir = path.resolve(process.env.UPLOAD_DIR || './uploads');
-const publicBase = () => (process.env.PUBLIC_BASE_URL || `http://localhost:${process.env.PORT || 3000}`).replace(/\/$/, '');
+// Always derive from the incoming request so Render's assigned hostname works
+// without having to configure PUBLIC_BASE_URL by hand.
+const publicBase = req => `${req.protocol}://${req.get('host')}`.replace(/\/$/, '');
+const callbackUrl = req => `${publicBase(req)}/api/social/instagram/callback`;
+const tiktokCallbackUrl = req => `${publicBase(req)}/api/social/tiktok/callback`;
 
 function need(res, names) {
   const missing = names.filter(n => !process.env[n]);
@@ -33,7 +37,7 @@ router.post('/media', async (req, res) => {
     const suffix = ext || map[mime] || '.bin';
     const name = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}${suffix}`;
     fs.writeFileSync(path.join(uploadDir, name), buf);
-    res.json({ url: `${publicBase()}/uploads/${name}`, size: buf.length, mime });
+    res.json({ url: `${publicBase(req)}/uploads/${name}`, size: buf.length, mime });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -43,11 +47,11 @@ router.post('/media', async (req, res) => {
 
 // Step 1 URL for the user to open (Instagram Login)
 router.get('/instagram/auth-url', (req, res) => {
-  if (!need(res, ['INSTAGRAM_APP_ID', 'INSTAGRAM_REDIRECT_URI'])) return;
+  if (!need(res, ['INSTAGRAM_APP_ID'])) return;
   const state = crypto.randomBytes(12).toString('hex');
   const url = new URL('https://www.instagram.com/oauth/authorize');
   url.searchParams.set('client_id', process.env.INSTAGRAM_APP_ID);
-  url.searchParams.set('redirect_uri', process.env.INSTAGRAM_REDIRECT_URI);
+  url.searchParams.set('redirect_uri', callbackUrl(req));
   url.searchParams.set('scope', 'instagram_content_publish,instagram_basic');
   url.searchParams.set('response_type', 'code');
   url.searchParams.set('state', state);
@@ -72,7 +76,7 @@ router.get('/instagram/callback', (req, res) => {
 // Exchange short-lived code -> long-lived token
 router.post('/instagram/token', async (req, res) => {
   try {
-    if (!need(res, ['INSTAGRAM_APP_ID', 'INSTAGRAM_APP_SECRET', 'INSTAGRAM_REDIRECT_URI'])) return;
+    if (!need(res, ['INSTAGRAM_APP_ID', 'INSTAGRAM_APP_SECRET'])) return;
     const { code } = req.body;
     if (!code) return res.status(400).json({ error: 'Missing code' });
 
@@ -81,7 +85,7 @@ router.post('/instagram/token', async (req, res) => {
         client_id: process.env.INSTAGRAM_APP_ID,
         client_secret: process.env.INSTAGRAM_APP_SECRET,
         grant_type: 'authorization_code',
-        redirect_uri: process.env.INSTAGRAM_REDIRECT_URI,
+        redirect_uri: callbackUrl(req),
         code
       }
     });
@@ -178,14 +182,14 @@ router.post('/instagram/publish', async (req, res) => {
 /* ---------- TikTok ---------- */
 
 router.get('/tiktok/auth-url', (req, res) => {
-  if (!need(res, ['TIKTOK_CLIENT_KEY', 'TIKTOK_REDIRECT_URI'])) return;
+  if (!need(res, ['TIKTOK_CLIENT_KEY'])) return;
   const state = crypto.randomBytes(12).toString('hex');
   const csrf = crypto.randomBytes(12).toString('hex');
   const url = new URL('https://www.tiktok.com/v2/auth/authorize/');
   url.searchParams.set('client_key', process.env.TIKTOK_CLIENT_KEY);
   url.searchParams.set('scope', 'video.publish,user.info.basic');
   url.searchParams.set('response_type', 'code');
-  url.searchParams.set('redirect_uri', process.env.TIKTOK_REDIRECT_URI);
+  url.searchParams.set('redirect_uri', tiktokCallbackUrl(req));
   url.searchParams.set('state', state);
   url.searchParams.set('code_challenge_method', 'S256');
   // PKCE would go here; kept simple for now
@@ -208,7 +212,7 @@ router.get('/tiktok/callback', (req, res) => {
 
 router.post('/tiktok/token', async (req, res) => {
   try {
-    if (!need(res, ['TIKTOK_CLIENT_KEY', 'TIKTOK_CLIENT_SECRET', 'TIKTOK_REDIRECT_URI'])) return;
+    if (!need(res, ['TIKTOK_CLIENT_KEY', 'TIKTOK_CLIENT_SECRET'])) return;
     const { code } = req.body;
     if (!code) return res.status(400).json({ error: 'Missing code' });
     const r = await axios.post(
@@ -218,7 +222,7 @@ router.post('/tiktok/token', async (req, res) => {
         client_secret: process.env.TIKTOK_CLIENT_SECRET,
         code,
         grant_type: 'authorization_code',
-        redirect_uri: process.env.TIKTOK_REDIRECT_URI
+        redirect_uri: tiktokCallbackUrl(req)
       }),
       { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
     );
