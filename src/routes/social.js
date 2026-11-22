@@ -359,16 +359,34 @@ router.post('/tiktok/publish', async (req, res) => {
 
     let sourceInfo;
     let fileBuffer;
+    let chunkRanges = [];
     if (videoBase64) {
       const base64 = String(videoBase64).replace(/^data:[^,]+,/, '');
       fileBuffer = Buffer.from(base64, 'base64');
       if (!fileBuffer.length) return res.status(400).json({ error: 'Empty video file' });
-      const chunkSize = 5 * 1024 * 1024;
+      // TikTok requires each chunk to be >= 5 MB; files under 5 MB must be sent
+      // whole with chunk_size === video_size and a single chunk. For larger
+      // files use ~10 MB chunks, folding any trailing bytes into the last one.
+      const MIN_CHUNK = 5 * 1024 * 1024;
+      const TARGET_CHUNK = 10 * 1024 * 1024;
+      const size = fileBuffer.length;
+      if (size <= MIN_CHUNK) {
+        chunkRanges = [[0, size - 1]];
+      } else {
+        let count = Math.max(1, Math.floor(size / TARGET_CHUNK));
+        while (size / count < MIN_CHUNK && count > 1) count--;
+        const base = Math.floor(size / count);
+        for (let i = 0; i < count; i++) {
+          const start = i * base;
+          const end = i === count - 1 ? size - 1 : start + base - 1;
+          chunkRanges.push([start, end]);
+        }
+      }
       sourceInfo = {
         source: 'FILE_UPLOAD',
-        video_size: fileBuffer.length,
-        chunk_size: chunkSize,
-        total_chunk_count: Math.ceil(fileBuffer.length / chunkSize)
+        video_size: size,
+        chunk_size: chunkRanges[0][1] - chunkRanges[0][0] + 1,
+        total_chunk_count: chunkRanges.length
       };
     } else if (videoUrl) {
       sourceInfo = { source: 'PULL_FROM_URL', video_url: videoUrl };
@@ -395,13 +413,11 @@ router.post('/tiktok/publish', async (req, res) => {
     const uploadUrl = init.data?.data?.upload_url;
 
     if (fileBuffer && uploadUrl) {
-      const chunkSize = sourceInfo.chunk_size;
-      for (let i = 0; i < sourceInfo.total_chunk_count; i++) {
-        const start = i * chunkSize;
-        const end = Math.min(start + chunkSize, fileBuffer.length) - 1;
+      for (const [start, end] of chunkRanges) {
         await axios.put(uploadUrl, fileBuffer.subarray(start, end + 1), {
           headers: {
             'Content-Type': mime,
+            'Content-Length': end - start + 1,
             'Content-Range': `bytes ${start}-${end}/${fileBuffer.length}`
           },
           maxBodyLength: Infinity,
