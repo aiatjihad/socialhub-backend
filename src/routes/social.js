@@ -341,11 +341,36 @@ router.post('/tiktok/token', async (req, res) => {
   }
 });
 
-// Publish from a public URL (PULL_FROM_URL) — no file upload needed
+// Publish a video. FILE_UPLOAD works without a verified domain; PULL_FROM_URL
+// is kept for callers that own a domain verified with TikTok.
 router.post('/tiktok/publish', async (req, res) => {
   try {
-    const { accessToken, videoUrl, title = '', privacy = 'PUBLIC_TO_EVERYONE' } = req.body;
-    if (!accessToken || !videoUrl) return res.status(400).json({ error: 'accessToken and videoUrl required' });
+    const {
+      accessToken, videoUrl, videoBase64, mime = 'video/mp4',
+      title = '', privacy = 'PUBLIC_TO_EVERYONE'
+    } = req.body;
+    if (!accessToken) return res.status(400).json({ error: 'accessToken required' });
+
+    let sourceInfo;
+    let fileBuffer;
+    if (videoBase64) {
+      const base64 = String(videoBase64).replace(/^data:[^,]+,/, '');
+      fileBuffer = Buffer.from(base64, 'base64');
+      if (!fileBuffer.length) return res.status(400).json({ error: 'Empty video file' });
+      const chunkSize = 5 * 1024 * 1024;
+      sourceInfo = {
+        source: 'FILE_UPLOAD',
+        video_size: fileBuffer.length,
+        chunk_size: chunkSize,
+        total_chunk_count: Math.ceil(fileBuffer.length / chunkSize)
+      };
+    } else if (videoUrl) {
+      sourceInfo = { source: 'PULL_FROM_URL', video_url: videoUrl };
+    } else {
+      return res.status(400).json({ error: 'videoBase64 or videoUrl required' });
+    }
+
+    const headers = { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' };
     const init = await axios.post(
       'https://open.tiktokapis.com/v2/post/publish/video/init/',
       {
@@ -356,11 +381,30 @@ router.post('/tiktok/publish', async (req, res) => {
           disable_comment: false,
           disable_stitch: false
         },
-        source_info: { source: 'PULL_FROM_URL', video_url: videoUrl }
+        source_info: sourceInfo
       },
-      { headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' } }
+      { headers }
     );
-    res.json({ publishId: init.data?.data?.publish_id, status: init.data?.data?.status });
+    const publishId = init.data?.data?.publish_id;
+    const uploadUrl = init.data?.data?.upload_url;
+
+    if (fileBuffer && uploadUrl) {
+      const chunkSize = sourceInfo.chunk_size;
+      for (let i = 0; i < sourceInfo.total_chunk_count; i++) {
+        const start = i * chunkSize;
+        const end = Math.min(start + chunkSize, fileBuffer.length) - 1;
+        await axios.put(uploadUrl, fileBuffer.subarray(start, end + 1), {
+          headers: {
+            'Content-Type': mime,
+            'Content-Range': `bytes ${start}-${end}/${fileBuffer.length}`
+          },
+          maxBodyLength: Infinity,
+          maxContentLength: Infinity
+        });
+      }
+    }
+
+    res.json({ publishId, status: init.data?.data?.status, uploadUrl: uploadUrl ? true : false });
   } catch (e) {
     res.status(400).json({ error: e.response?.data?.error?.message || e.message });
   }
